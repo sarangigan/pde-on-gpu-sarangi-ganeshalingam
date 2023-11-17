@@ -1,0 +1,121 @@
+const USE_GPU = true
+using ParallelStencil
+using ParallelStencil.FiniteDifferences2D
+@static if USE_GPU
+    @init_parallel_stencil(CUDA, Float64, 2, inbounds=true)
+else
+    @init_parallel_stencil(Threads, Float64, 2, inbounds=true)
+end
+using Plots, Printf, MAT, DelimitedFiles
+using ImplicitGlobalGrid
+using MPI
+MPI.Init()
+
+# macros to avoid array allocation
+macro qx(ix, iy) esc(:(-D_dx * (C[$ix+1, $iy+1] - C[$ix, $iy+1]))) end
+macro qy(ix, iy) esc(:(-D_dy * (C[$ix+1, $iy+1] - C[$ix+1, $iy]))) end
+
+@parallel_indices (ix, iy) function compute!(C2, C, D_dx, D_dy, dt, _dx, _dy, size_C1_2, size_C2_2)
+    if (ix <= size_C1_2 && iy <= size_C2_2)
+        C2[ix+1, iy+1] = C[ix+1, iy+1] - dt * ((@qx(ix + 1, iy) - @qx(ix, iy)) * _dx + (@qy(ix, iy + 1) - @qy(ix, iy)) * _dy)
+    end
+    return
+end
+
+@views function diffusion_2D(; nx=64, ny=64, ttot=1e0, do_visu=false, do_save=false)
+    # Physics
+    Lx, Ly = 10.0, 10.0
+    D      = 1.0
+    # Numerics
+    nx, ny  = nx, ny # number of grid points
+    ttot    = ttot 
+    nout    = 20
+    # Derived numerics
+    me, dims = init_global_grid(nx, ny, 1; init_MPI=false)  # Initialization of MPI and more...
+    dx, dy  = Lx/nx_g(), Ly/ny_g()
+    dt     = min(dx, dy)^2 / D / 4.1
+    nt     = min(cld(ttot, dt), ceil(651*2048/nx))
+    println("nt=", nt)
+    xc, yc = LinRange(dx / 2, Lx - dx / 2, nx), LinRange(dy / 2, Ly - dy / 2, ny)
+    D_dx   = D / dx
+    D_dy   = D / dy
+    _dx, _dy = 1.0 / dx, 1.0 / dy
+    
+    # Array initialisation
+    C       = @zeros(nx,ny)
+    C      .= Data.Array([exp(-(x_g(ix,dx,C)+dx/2 -Lx/2)^2 -(y_g(iy,dy,C)+dy/2 -Ly/2)^2) for ix=1:size(C,1), iy=1:size(C,2)])
+    C2     = copy(C)
+    size_C1_2, size_C2_2 = size(C, 1) - 2, size(C, 2) - 2
+    t_tic  = 0.0
+    niter  = 0
+
+    if do_visu
+        if (me==0) ENV["GKSwstype"]="nul"; if isdir("viz2D_mxpu_out")==false mkdir("viz2D_mxpu_out") end; loadpath = "./viz2D_mxpu_out/"; anim = Animation(loadpath,String[]); println("Animation directory: $(anim.dir)") end
+        nx_v, ny_v = (nx-2)*dims[1], (ny-2)*dims[2]
+        if (nx_v*ny_v*sizeof(Data.Number) > 0.8*Sys.free_memory()) error("Not enough memory for visualization.") end
+        C_v   = zeros(nx_v, ny_v) # global array for visu
+        C_inn = zeros(nx-2, ny-2) # no halo local array for visu
+        xi_g, yi_g = LinRange(dx+dx/2, Lx-dx-dx/2, nx_v), LinRange(dy+dy/2, Ly-dy-dy/2, ny_v) # inner points only
+    end
+
+    # Time loop
+    for it = 1:nt
+        if (it == 11) t_tic = Base.time(); niter = 0 end
+        @hide_communication (8, 2) begin
+            @parallel compute!(C2, C, D_dx, D_dy, dt, _dx, _dy, size_C1_2, size_C2_2)
+            C, C2 = C2, C # pointer swap
+            update_halo!(C)
+        end
+        niter += 1
+        # Visualize
+        if do_visu && (it % nout == 0)
+            C_inn .= Array(C)[2:end-1,2:end-1]; gather!(C_inn, C_v)
+            if (me==0)
+                opts = (aspect_ratio=1, xlims=(xi_g[1], xi_g[end]), ylims=(yi_g[1], yi_g[end]), clims=(0.0, 1.0), c=:turbo, xlabel="Lx", ylabel="Ly", title="time = $(round(it*dt, sigdigits=3))")
+                heatmap(xi_g, yi_g, Array(C_v)'; opts...); frame(anim)
+            end
+        end
+    end
+    t_toc = Base.time() - t_tic
+    A_eff = 2 / 1e9 * nx * ny * sizeof(Float64)  # Effective main memory access per iteration [GB]
+    t_it  = t_toc / niter                  # Execution time per iteration [s]
+    T_eff = A_eff / t_it                   # Effective memory throughput [GB/s]
+    @printf("Time = %1.6f sec, T_eff = %1.2f GB/s (niter = %d)\n", t_toc, round(T_eff, sigdigits=3), niter)
+    if (do_visu && me==0) gif(anim, "diffusion_2D_mxpu.gif", fps = 5)  end
+
+    if (do_save && me==0)
+        file = matopen(@sprintf("docs/multi_xpu_2D_out_C_%d_%04d.mat", me, nt), "w")
+        write(file, "C_v", Array(C_v))
+        close(file)
+    end
+
+    finalize_global_grid(; finalize_MPI=false)
+    return T_eff
+end
+
+# Strong scaling
+# length_ls = 16 * 2 .^ (1:10)
+# T_eff_ls = []
+
+# for ls in length_ls
+#     push!(T_eff_ls,diffusion_2D(nx=ls, ny=ls))
+# end
+# MPI.Finalize()
+
+# writedlm("docs/strong_scaling.txt", T_eff_ls) #output the resutls
+
+# Weak scaling
+resol = 16 * 2 ^ 10
+diffusion_2D(nx=resol, ny=resol)
+# Time =  0.675384 sec for nx = ny = 16 * 2 ^10 for single GPU
+# 0.704903 4 gpu
+# 0.715465 16gpu
+# 0.732396 25 gpu
+# 0.737644 64gpu
+
+# @hide_communication
+# 0.748813 (0,0)
+# 0.738977 (2,2)
+# 0.737644 (8,2)
+# 0.754603 (16,4)
+# 0.767212 (16,16)
