@@ -1,0 +1,17 @@
+salloc -C'gpu' -Aclass04 -N4 -n4 --time=01:00:00
+
+srun -n1 --pty /bin/bash -l
+module load daint-gpu Julia/1.9.3-CrayGNU-21.09-cuda
+
+
+
+julia
+
+
+
+
+sbatch submit.sh
+
+squeue -u class211
+
+convert -delay 20 -loop 0 out_*.png out_T.gif
